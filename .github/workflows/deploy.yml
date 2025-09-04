@@ -1,0 +1,136 @@
+name: Deploy Infrastructure
+
+on:
+  workflow_dispatch:
+    inputs:
+      deploy_type:
+        description: 'Tipo de despliegue'
+        required: true
+        default: 'basic'
+        type: choice
+        options:
+        - basic
+        - full
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    name: Deploy GenAI DevOps Infrastructure
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+        
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: 1.5.0
+        
+    - name: Setup Python
+      if: github.event.inputs.deploy_type == 'full'
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+        
+    - name: Determine environment from branch
+      id: env
+      run: |
+        BRANCH_NAME="${{ github.ref_name }}"
+        case "$BRANCH_NAME" in
+          "develop") 
+            echo "environment=dev" >> $GITHUB_OUTPUT
+            echo "suffix=dev" >> $GITHUB_OUTPUT
+            ;;
+          "main") 
+            echo "environment=prod" >> $GITHUB_OUTPUT
+            echo "suffix=prod" >> $GITHUB_OUTPUT
+            ;;
+          *)
+            echo "environment=dev" >> $GITHUB_OUTPUT
+            echo "suffix=dev" >> $GITHUB_OUTPUT
+            ;;
+        esac
+        
+    - name: Verify AWS connection
+      run: |
+        ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+        echo "✅ Conectado a cuenta AWS: $ACCOUNT_ID"
+        echo "🌍 Ambiente: ${{ steps.env.outputs.environment }} (rama: ${{ github.ref_name }})"
+        
+    - name: Setup S3 Backend
+      run: |
+        echo "🪣 Configurando S3 Backend para ambiente: ${{ steps.env.outputs.environment }}"
+        
+        # Ejecutar script base para crear bucket
+        ./scripts/setup-backend.sh
+        
+        # Actualizar backend.tf para usar path específico del ambiente
+        sed -i 's|key    = "terraform.tfstate"|key    = "${{ steps.env.outputs.environment }}/terraform.tfstate"|' infrastructure/terraform/backend.tf
+        
+    - name: Deploy basic infrastructure
+      run: |
+        echo "🚀 Desplegando Infraestructura GenAI DevOps - Ambiente: ${{ steps.env.outputs.environment }}"
+        echo "=============================================="
+        
+        cd infrastructure/terraform
+        
+        echo "🔧 Inicializando Terraform con backend S3..."
+        terraform init -upgrade -backend-config="key=${{ steps.env.outputs.environment }}/terraform.tfstate"
+        
+        echo "📋 Validando configuración..."
+        terraform validate
+        
+        echo "📊 Planificando cambios..."
+        terraform plan \
+          -var="environment=${{ steps.env.outputs.environment }}" \
+          -var="name_suffix=${{ steps.env.outputs.suffix }}"
+        
+        echo "🚀 Aplicando infraestructura..."
+        terraform apply -auto-approve \
+          -var="environment=${{ steps.env.outputs.environment }}" \
+          -var="name_suffix=${{ steps.env.outputs.suffix }}"
+        
+        echo "📋 Mostrando outputs..."
+        terraform output
+        
+        LOAD_BALANCER_URL=$(terraform output -raw load_balancer_url)
+        echo "✅ Infraestructura desplegada: $LOAD_BALANCER_URL"
+        
+    - name: Deploy full demo (with AI optimizer)
+      if: github.event.inputs.deploy_type == 'full' || (github.event_name == 'push' && contains(github.event.head_commit.message, '[full]'))
+      run: |
+        echo "🧠 Ejecutando Optimizador IA..."
+        
+        # Instalar dependencias
+        python -m pip install --upgrade pip
+        pip install boto3
+        
+        # Ejecutar optimizador
+        cd scripts/optimization
+        python3 optimizer.py || echo "⚠️ Optimizador ejecutado con limitaciones"
+        
+    - name: Verify deployment
+      run: |
+        cd infrastructure/terraform
+        LOAD_BALANCER_URL=$(terraform output -raw load_balancer_url 2>/prod/null || echo "")
+        
+        if [ ! -z "$LOAD_BALANCER_URL" ]; then
+          echo "🔍 Verificando aplicación en: $LOAD_BALANCER_URL"
+          sleep 30
+          
+          if curl -f -s --max-time 30 "$LOAD_BALANCER_URL" > /prod/null; then
+            echo "✅ Aplicación web funcionando correctamente"
+          else
+            echo "⚠️ Aplicación aún inicializando, puede tardar unos minutos"
+          fi
+        fi

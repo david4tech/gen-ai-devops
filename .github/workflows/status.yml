@@ -1,0 +1,121 @@
+name: Infrastructure Status
+
+on:
+  workflow_dispatch:
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+jobs:
+  status:
+    runs-on: ubuntu-latest
+    name: Check Infrastructure Status
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+        
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: 1.5.0
+        
+    - name: Determine environment from branch
+      id: env
+      run: |
+        BRANCH_NAME="${{ github.ref_name }}"
+        case "$BRANCH_NAME" in
+          "develop") 
+            echo "environment=dev" >> $GITHUB_OUTPUT
+            echo "suffix=dev" >> $GITHUB_OUTPUT
+            ;;
+          "main") 
+            echo "environment=prod" >> $GITHUB_OUTPUT
+            echo "suffix=prod" >> $GITHUB_OUTPUT
+            ;;
+          *)
+            echo "environment=dev" >> $GITHUB_OUTPUT
+            echo "suffix=dev" >> $GITHUB_OUTPUT
+            ;;
+        esac
+        
+    - name: Setup S3 Backend
+      run: |
+        echo "🪣 Configurando S3 Backend para ambiente: ${{ steps.env.outputs.environment }}"
+        
+        # Ejecutar script base para crear bucket
+        ./scripts/setup-backend.sh
+        
+        # Actualizar backend.tf para usar path específico del ambiente
+        sed -i 's|key    = "terraform.tfstate"|key    = "${{ steps.env.outputs.environment }}/terraform.tfstate"|' infrastructure/terraform/backend.tf
+        
+    - name: Check infrastructure status
+      run: |
+        echo "📊 Estado de la Infraestructura GenAI DevOps - Ambiente: ${{ steps.env.outputs.environment }}"
+        echo "=============================================="
+        
+        cd infrastructure/terraform
+        terraform init -backend-config="key=${{ steps.env.outputs.environment }}/terraform.tfstate"
+        
+        # Verificar si hay recursos desplegados
+        RESOURCE_COUNT=$(terraform show -json 2>/prod/null | jq -r '.values.root_module.resources // [] | length' 2>/prod/null || echo "0")
+        
+        if [ "$RESOURCE_COUNT" -eq 0 ]; then
+          echo "⚠️ No hay infraestructura desplegada en ambiente ${{ steps.env.outputs.environment }}."
+          echo "Ejecuta el pipeline de Deploy para crear recursos."
+          exit 0
+        fi
+        
+        echo "✅ Infraestructura desplegada en ${{ steps.env.outputs.environment }} ($RESOURCE_COUNT recursos)"
+        echo ""
+        
+        # Mostrar outputs
+        terraform output
+        
+        # Probar aplicación
+        LOAD_BALANCER_URL=$(terraform output -raw load_balancer_url 2>/prod/null || echo "")
+        if [ ! -z "$LOAD_BALANCER_URL" ]; then
+          echo ""
+          echo "🌐 Probando aplicación..."
+          if curl -s --max-time 10 "$LOAD_BALANCER_URL" > /prod/null; then
+            echo "✅ Aplicación funcionando: $LOAD_BALANCER_URL"
+          else
+            echo "⚠️ Aplicación no responde: $LOAD_BALANCER_URL"
+          fi
+        fi
+        
+    - name: List AWS resources
+      run: |
+        echo ""
+        echo "📋 Recursos AWS activos:"
+        echo "========================"
+        
+        # EC2 Instances
+        echo "🖥️ Instancias EC2:"
+        aws ec2 describe-instances \
+          --filters "Name=instance-state-name,Values=running" \
+          --query 'Reservations[].Instances[].{ID:InstanceId,Type:InstanceType,State:State.Name}' \
+          --output table || echo "No hay instancias EC2 ejecutándose"
+          
+        echo ""
+        
+        # Load Balancers
+        echo "⚖️ Load Balancers:"
+        aws elbv2 describe-load-balancers \
+          --query 'LoadBalancers[].{Name:LoadBalancerName,State:State.Code,DNS:DNSName}' \
+          --output table || echo "No hay Load Balancers activos"
+          
+        echo ""
+        
+        # RDS Clusters
+        echo "🗄️ RDS Clusters:"
+        aws rds describe-db-clusters \
+          --query 'DBClusters[].{ID:DBClusterIdentifier,Engine:Engine,Status:Status}' \
+          --output table || echo "No hay clusters RDS activos"

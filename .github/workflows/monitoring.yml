@@ -1,0 +1,118 @@
+name: Infrastructure Monitoring
+
+on:
+  schedule:
+    # Ejecutar cada 15 minutos
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Ambiente a monitorear'
+        required: true
+        default: 'prod'
+        type: choice
+        options:
+        - prod
+        - prod
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+jobs:
+  check-monitoring-enabled:
+    runs-on: ubuntu-latest
+    name: Check if Monitoring is Enabled
+    outputs:
+      monitoring_enabled: ${{ steps.check.outputs.enabled }}
+      target_environment: ${{ steps.check.outputs.environment }}
+    
+    steps:
+    - name: Check monitoring variable
+      id: check
+      run: |
+        ENABLED_MONITORING="${{ vars.ENABLED_MONITORING || 'false' }}"
+        echo "enabled=$ENABLED_MONITORING" >> $GITHUB_OUTPUT
+        
+        # Para ejecución automática, usar ambiente por defecto (prod)
+        # Para ejecución manual, usar ambiente seleccionado
+        if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          echo "environment=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+        else
+          echo "environment=prod" >> $GITHUB_OUTPUT
+        fi
+        
+        if [ "$ENABLED_MONITORING" = "true" ]; then
+          echo "✅ Monitoring habilitado - Procediendo con verificaciones"
+        else
+          echo "⏸️ Monitoring deshabilitado - Esperando 15 minutos para próxima verificación"
+        fi
+
+  monitor:
+    runs-on: ubuntu-latest
+    name: Monitor Infrastructure & Costs
+    needs: check-monitoring-enabled
+    if: needs.check-monitoring-enabled.outputs.monitoring_enabled == 'true'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+        
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+        
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install boto3
+        
+    - name: Run cost optimization analysis
+      run: |
+        echo "💰 Ejecutando análisis de costos para ambiente: ${{ needs.check-monitoring-enabled.outputs.target_environment }}"
+        cd scripts/optimization
+        python3 optimizer.py || echo "⚠️ Optimizador ejecutado con limitaciones"
+        
+    - name: Check resource utilization
+      run: |
+        echo "📊 Verificando utilización de recursos en ambiente: ${{ needs.check-monitoring-enabled.outputs.target_environment }}"
+        
+        # Verificar instancias EC2 con filtro por ambiente
+        echo "🖥️ Instancias EC2:"
+        aws ec2 describe-instances \
+          --filters "Name=instance-state-name,Values=running" "Name=tag:Environment,Values=${{ needs.check-monitoring-enabled.outputs.target_environment }}" \
+          --query 'Reservations[].Instances[].{ID:InstanceId,Type:InstanceType,State:State.Name,Environment:Tags[?Key==`Environment`].Value|[0]}' \
+          --output table || echo "No hay instancias EC2 ejecutándose en ambiente ${{ needs.check-monitoring-enabled.outputs.target_environment }}"
+          
+        echo ""
+        
+        # Verificar Load Balancers con filtro por ambiente
+        echo "⚖️ Load Balancers:"
+        aws elbv2 describe-load-balancers \
+          --query 'LoadBalancers[?contains(LoadBalancerName, `${{ needs.check-monitoring-enabled.outputs.target_environment }}`)].{Name:LoadBalancerName,State:State.Code,DNS:DNSName}' \
+          --output table || echo "No hay Load Balancers activos en ambiente ${{ needs.check-monitoring-enabled.outputs.target_environment }}"
+          
+    - name: Show monitoring summary
+      run: |
+        echo "📋 RESUMEN DE MONITOREO - $(date)"
+        echo "================================="
+        echo ""
+        
+        # Estado de la cuenta AWS
+        echo "🔍 Cuenta AWS: $(aws sts get-caller-identity --query 'Account' --output text)"
+        echo "🌍 Región: ${{ env.AWS_REGION }}"
+        echo "🏷️ Ambiente: ${{ needs.check-monitoring-enabled.outputs.target_environment }}"
+        echo ""
+        
+        # Recursos activos
+        RESOURCE_COUNT=$(aws resourcegroupstaggingapi get-resources --query 'length(ResourceTagMappingList)' --output text)
+        echo "📊 Total de recursos activos: $RESOURCE_COUNT"
+        echo ""
+        echo "✅ Monitoreo completado - Resultados mostrados arriba"

@@ -1,0 +1,115 @@
+name: Destroy Infrastructure
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_destroy:
+        description: 'Confirmar destrucción (escribir "DESTROY" para confirmar)'
+        required: true
+        type: string
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+jobs:
+  destroy:
+    runs-on: ubuntu-latest
+    name: Destroy GenAI DevOps Infrastructure
+    
+    steps:
+    - name: Validate confirmation
+      run: |
+        if [ "${{ github.event.inputs.confirm_destroy }}" != "DESTROY" ]; then
+          echo "❌ Confirmación incorrecta. Debes escribir exactamente 'DESTROY' para confirmar."
+          exit 1
+        fi
+        echo "✅ Confirmación válida. Procediendo con la destrucción del ambiente ${{ steps.env.outputs.environment }}..."
+        
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+        
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: 1.5.0
+        
+    - name: Determine environment from branch
+      id: env
+      run: |
+        BRANCH_NAME="${{ github.ref_name }}"
+        case "$BRANCH_NAME" in
+          "develop") 
+            echo "environment=dev" >> $GITHUB_OUTPUT
+            echo "suffix=dev" >> $GITHUB_OUTPUT
+            ;;
+          "main") 
+            echo "environment=prod" >> $GITHUB_OUTPUT
+            echo "suffix=prod" >> $GITHUB_OUTPUT
+            ;;
+          *)
+            echo "environment=dev" >> $GITHUB_OUTPUT
+            echo "suffix=dev" >> $GITHUB_OUTPUT
+            ;;
+        esac
+        
+    - name: Setup S3 Backend
+      run: |
+        echo "🪣 Configurando S3 Backend para ambiente: ${{ steps.env.outputs.environment }}"
+        
+        # Ejecutar script base para crear bucket
+        ./scripts/setup-backend.sh
+        
+        # Actualizar backend.tf para usar path específico del ambiente
+        sed -i 's|key    = "terraform.tfstate"|key    = "${{ steps.env.outputs.environment }}/terraform.tfstate"|' infrastructure/terraform/backend.tf
+        
+    - name: Show resources to be destroyed
+      run: |
+        echo "🗑️ Recursos que serán destruidos en ambiente: ${{ steps.env.outputs.environment }}"
+        echo "================================="
+        
+        cd infrastructure/terraform
+        terraform init -backend-config="key=${{ steps.env.outputs.environment }}/terraform.tfstate"
+        
+        # Mostrar plan de destrucción
+        terraform plan -destroy \
+          -var="environment=${{ steps.env.outputs.environment }}" \
+          -var="name_suffix=${{ steps.env.outputs.suffix }}"
+        
+    - name: Destroy infrastructure
+      run: |
+        echo "🗑️ Destruyendo infraestructura GenAI DevOps - Ambiente: ${{ steps.env.outputs.environment }}"
+        echo ""
+        echo "⚠️ ADVERTENCIA: Eliminando TODOS los recursos AWS del ambiente ${{ steps.env.outputs.environment }}."
+        echo ""
+        
+        cd infrastructure/terraform
+        
+        # Ejecutar destrucción
+        terraform destroy -auto-approve \
+          -var="environment=${{ steps.env.outputs.environment }}" \
+          -var="name_suffix=${{ steps.env.outputs.suffix }}"
+        
+        echo ""
+        echo "✅ Infraestructura del ambiente ${{ steps.env.outputs.environment }} destruida exitosamente"
+        
+    - name: Verify destruction
+      run: |
+        cd infrastructure/terraform
+        
+        # Verificar que no quedan recursos
+        RESOURCE_COUNT=$(terraform show -json 2>/prod/null | jq -r '.values.root_module.resources // [] | length' 2>/prod/null || echo "0")
+        
+        if [ "$RESOURCE_COUNT" -eq 0 ]; then
+          echo "✅ Confirmado: No hay recursos activos en ambiente ${{ steps.env.outputs.environment }}"
+          echo "💰 Costos detenidos para ambiente ${{ steps.env.outputs.environment }}: $0/hora"
+        else
+          echo "⚠️ Advertencia: Aún hay $RESOURCE_COUNT recursos activos en ambiente ${{ steps.env.outputs.environment }}"
+          terraform show
+        fi

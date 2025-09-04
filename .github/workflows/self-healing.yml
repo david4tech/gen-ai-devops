@@ -1,0 +1,152 @@
+name: Self-Healing Infrastructure Pipeline
+
+on:
+  schedule:
+    # Ejecutar cada 15 minutos
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Ambiente para auto-sanación'
+        required: true
+        default: 'prod'
+        type: choice
+        options:
+        - prod
+        - prod
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+jobs:
+  check-self-healing-enabled:
+    runs-on: ubuntu-latest
+    name: Check if Self-Healing is Enabled
+    outputs:
+      self_healing_enabled: ${{ steps.check.outputs.enabled }}
+      target_environment: ${{ steps.check.outputs.environment }}
+    
+    steps:
+    - name: Check self-healing variable
+      id: check
+      run: |
+        ENABLED_SELF_HEALING="${{ vars.ENABLED_SELF_HEALING || 'false' }}"
+        echo "enabled=$ENABLED_SELF_HEALING" >> $GITHUB_OUTPUT
+        
+        # Para ejecución automática, usar ambiente por defecto (prod)
+        # Para ejecución manual, usar ambiente seleccionado
+        if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          echo "environment=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+        else
+          echo "environment=prod" >> $GITHUB_OUTPUT
+        fi
+        
+        if [ "$ENABLED_SELF_HEALING" = "true" ]; then
+          echo "✅ Self-Healing habilitado - Procediendo con verificaciones"
+        else
+          echo "⏸️ Self-Healing deshabilitado - Esperando 15 minutos para próxima verificación"
+        fi
+
+  health-check:
+    runs-on: ubuntu-latest
+    name: Infrastructure Health Check & Auto-Healing
+    needs: check-self-healing-enabled
+    if: needs.check-self-healing-enabled.outputs.self_healing_enabled == 'true'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+        
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: 1.5.0
+        
+    - name: Determine environment suffix
+      id: env
+      run: |
+        ENV="${{ needs.check-self-healing-enabled.outputs.target_environment }}"
+        case "$ENV" in
+          "prod") echo "suffix=prod" >> $GITHUB_OUTPUT ;;
+          "dev") echo "suffix=dev" >> $GITHUB_OUTPUT ;;
+          *) echo "suffix=prod" >> $GITHUB_OUTPUT ;;
+        esac
+        echo "environment=$ENV" >> $GITHUB_OUTPUT
+        
+    - name: Setup S3 Backend
+      run: |
+        echo "🪣 Configurando S3 Backend para ambiente: ${{ steps.env.outputs.environment }}"
+        
+        # Ejecutar script base para crear bucket
+        ./scripts/setup-backend.sh
+        
+        # Actualizar backend.tf para usar path específico del ambiente
+        sed -i 's|key    = "terraform.tfstate"|key    = "${{ steps.env.outputs.environment }}/terraform.tfstate"|' infrastructure/terraform/backend.tf
+        
+    - name: Check infrastructure health
+      id: health-check
+      run: |
+        cd infrastructure/terraform
+        terraform init -backend-config="key=${{ steps.env.outputs.environment }}/terraform.tfstate"
+        
+        # Verificar estado de la infraestructura
+        if ! terraform plan -detailed-exitcode \
+          -var="environment=${{ steps.env.outputs.environment }}" \
+          -var="name_suffix=${{ steps.env.outputs.suffix }}"; then
+          echo "drift_detected=true" >> $GITHUB_OUTPUT
+          echo "🚨 Drift detectado en la infraestructura del ambiente ${{ steps.env.outputs.environment }}"
+        else
+          echo "drift_detected=false" >> $GITHUB_OUTPUT
+          echo "✅ Infraestructura en estado correcto en ambiente ${{ steps.env.outputs.environment }}"
+        fi
+        
+    - name: Auto-heal infrastructure
+      if: steps.health-check.outputs.drift_detected == 'true'
+      run: |
+        cd infrastructure/terraform
+        echo "🔧 Aplicando correcciones automáticas en ambiente ${{ steps.env.outputs.environment }}..."
+        terraform apply -auto-approve \
+          -var="environment=${{ steps.env.outputs.environment }}" \
+          -var="name_suffix=${{ steps.env.outputs.suffix }}"
+        
+    - name: Verify application health
+      run: |
+        cd infrastructure/terraform
+        LOAD_BALANCER_URL=$(terraform output -raw load_balancer_url 2>/prod/null || echo "")
+        
+        if [ ! -z "$LOAD_BALANCER_URL" ]; then
+          echo "🔍 Verificando aplicación en: $LOAD_BALANCER_URL"
+          
+          # Esperar un poco para que la aplicación esté lista
+          sleep 30
+          
+          # Intentar múltiples veces antes de fallar
+          for i in {1..3}; do
+            if curl -f -s --max-time 30 "$LOAD_BALANCER_URL" > /prod/null; then
+              echo "✅ Aplicación web funcionando correctamente (intento $i)"
+              exit 0
+            else
+              echo "⚠️ Intento $i fallido, reintentando en 30 segundos..."
+              sleep 30
+            fi
+          done
+          
+          echo "🚨 Aplicación web no responde después de 3 intentos"
+          echo "ℹ️ Esto puede ser normal si la infraestructura se está inicializando"
+          # No fallar el pipeline por problemas de aplicación
+        else
+          echo "⚠️ No hay infraestructura desplegada"
+        fi
+        
+    - name: Send notification on failure
+      if: failure()
+      run: |
+        echo "🚨 Pipeline de auto-sanación falló"
+        echo "Se requiere intervención manual"

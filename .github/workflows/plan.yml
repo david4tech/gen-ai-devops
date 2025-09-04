@@ -1,0 +1,114 @@
+name: Infrastructure Plan
+
+on:
+  push:
+    paths:
+      - 'infrastructure/**'
+  pull_request:
+    paths:
+      - 'infrastructure/**'
+  workflow_dispatch:
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    name: Plan Infrastructure Changes
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+        
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: 1.5.0
+        
+    - name: Determine environment
+      id: env
+      run: |
+        if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+          echo "environment=prod" >> $GITHUB_OUTPUT
+          echo "suffix=prod" >> $GITHUB_OUTPUT
+        elif [[ "${{ github.ref }}" == "refs/heads/develop" ]]; then
+          echo "environment=dev" >> $GITHUB_OUTPUT
+          echo "suffix=dev" >> $GITHUB_OUTPUT
+        else
+          echo "environment=dev" >> $GITHUB_OUTPUT
+          echo "suffix=dev" >> $GITHUB_OUTPUT
+        fi
+        
+    - name: Setup S3 Backend
+      run: |
+        echo "🪣 Configurando S3 Backend para ambiente: ${{ steps.env.outputs.environment }}"
+        
+        # Ejecutar script base para crear bucket
+        ./scripts/setup-backend.sh
+        
+        # Actualizar backend.tf para usar path específico del ambiente
+        sed -i 's|key    = "terraform.tfstate"|key    = "${{ steps.env.outputs.environment }}/terraform.tfstate"|' infrastructure/terraform/backend.tf
+        
+    - name: Terraform Plan
+      run: |
+        echo "📋 Planificando cambios para ambiente: ${{ steps.env.outputs.environment }}"
+        
+        cd infrastructure/terraform
+        
+        # Inicializar con backend específico del ambiente
+        terraform init -upgrade -backend-config="key=${{ steps.env.outputs.environment }}/terraform.tfstate"
+        
+        # Planificar con variables de ambiente
+        terraform plan \
+          -var="environment=${{ steps.env.outputs.environment }}" \
+          -var="name_suffix=${{ steps.env.outputs.suffix }}" \
+          -out=tfplan-${{ steps.env.outputs.environment }}
+          
+    - name: Upload plan artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: tfplan-${{ steps.env.outputs.environment }}-${{ github.sha }}
+        path: infrastructure/terraform/tfplan-${{ steps.env.outputs.environment }}
+        retention-days: 30
+        
+    - name: Comment PR with plan
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@v6
+      with:
+        script: |
+          const fs = require('fs');
+          const { execSync } = require('child_process');
+          
+          // Ejecutar terraform show para obtener el plan legible
+          const planOutput = execSync('cd infrastructure/terraform && terraform show tfplan-${{ steps.env.outputs.environment }}', { encoding: 'utf8' });
+          
+          const comment = `## 📋 Terraform Plan - Ambiente: ${{ steps.env.outputs.environment }}
+          
+          <details>
+          <summary>Ver cambios de infraestructura</summary>
+          
+          \`\`\`
+          ${planOutput}
+          \`\`\`
+          
+          </details>
+          
+          **Ambiente:** ${{ steps.env.outputs.environment }}
+          **Sufijo:** ${{ steps.env.outputs.suffix }}
+          **Commit:** ${{ github.sha }}
+          `;
+          
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: comment
+          });

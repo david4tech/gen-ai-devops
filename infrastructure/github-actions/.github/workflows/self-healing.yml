@@ -1,0 +1,157 @@
+name: Self-Healing Infrastructure Pipeline
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'  # Cada 15 minutos
+  workflow_dispatch:
+  push:
+    paths:
+      - 'infrastructure/**'
+
+env:
+  AWS_REGION: us-east-1
+  BEDROCK_MODEL_ID: anthropic.claude-3-sonnet-20240229-v1:0
+
+jobs:
+  health-check:
+    runs-on: ubuntu-latest
+    outputs:
+      issues-detected: ${{ steps.analyze.outputs.issues }}
+      fix-required: ${{ steps.analyze.outputs.fix_required }}
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Collect System Metrics
+        id: metrics
+        run: |
+          # Obtener métricas de CloudWatch
+          aws cloudwatch get-metric-statistics \
+            --namespace AWS/ApplicationELB \
+            --metric-name TargetResponseTime \
+            --dimensions Name=LoadBalancer,Value=genai-alb \
+            --start-time $(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%S) \
+            --end-time $(date -u +%Y-%m-%dT%H:%M:%S) \
+            --period 300 \
+            --statistics Average > metrics.json
+          
+          # Obtener logs de errores
+          aws logs filter-log-events \
+            --log-group-name /aws/lambda/genai-function \
+            --start-time $(date -d '1 hour ago' +%s)000 \
+            --filter-pattern "ERROR" > errors.json
+      
+      - name: AI Analysis
+        id: analyze
+        run: |
+          # Crear prompt para análisis
+          cat > analysis_prompt.json << EOF
+          {
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 1000,
+            "messages": [
+              {
+                "role": "user",
+                "content": "Analiza estas métricas de infraestructura AWS y detecta problemas:\n\nMétricas: $(cat metrics.json)\n\nErrores: $(cat errors.json)\n\nResponde en formato JSON con: {\"issues_detected\": boolean, \"problems\": [\"lista de problemas\"], \"recommended_actions\": [\"lista de acciones\"]}"
+              }
+            ]
+          }
+          EOF
+          
+          # Invocar Bedrock para análisis
+          aws bedrock-runtime invoke-model \
+            --model-id ${{ env.BEDROCK_MODEL_ID }} \
+            --body file://analysis_prompt.json \
+            --cli-binary-format raw-in-base64-out \
+            analysis_response.json
+          
+          # Extraer resultados
+          ISSUES=$(jq -r '.content[0].text | fromjson | .issues_detected' analysis_response.json)
+          echo "issues=$ISSUES" >> $GITHUB_OUTPUT
+          echo "fix_required=$ISSUES" >> $GITHUB_OUTPUT
+
+  auto-remediation:
+    needs: health-check
+    if: needs.health-check.outputs.fix-required == 'true'
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Generate Fix
+        id: fix
+        run: |
+          # Generar código de corrección con IA
+          cat > fix_prompt.json << EOF
+          {
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 2000,
+            "messages": [
+              {
+                "role": "user",
+                "content": "Genera código Terraform para corregir estos problemas de infraestructura: ${{ needs.health-check.outputs.issues-detected }}. Incluye solo los recursos que necesitan modificación."
+              }
+            ]
+          }
+          EOF
+          
+          aws bedrock-runtime invoke-model \
+            --model-id ${{ env.BEDROCK_MODEL_ID }} \
+            --body file://fix_prompt.json \
+            --cli-binary-format raw-in-base64-out \
+            fix_response.json
+          
+          # Extraer código generado
+          jq -r '.content[0].text' fix_response.json > auto_fix.tf
+      
+      - name: Validate Fix
+        run: |
+          # Instalar Terraform
+          wget https://releases.hashicorp.com/terraform/1.6.0/terraform_1.6.0_linux_amd64.zip
+          unzip terraform_1.6.0_linux_amd64.zip
+          sudo mv terraform /usr/local/bin/
+          
+          # Validar sintaxis
+          terraform init
+          terraform validate
+          terraform plan -out=fix.tfplan
+      
+      - name: Apply Fix
+        if: success()
+        run: |
+          echo "Aplicando corrección automática..."
+          terraform apply -auto-approve fix.tfplan
+      
+      - name: Notify Results
+        run: |
+          echo "✅ Auto-remediación completada exitosamente"
+          echo "📊 Cambios aplicados: $(terraform show -json fix.tfplan | jq '.resource_changes | length')"
+
+  continuous-learning:
+    needs: [health-check, auto-remediation]
+    if: always()
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Update Learning Model
+        run: |
+          # Enviar feedback al modelo para aprendizaje continuo
+          cat > learning_data.json << EOF
+          {
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "issues_detected": "${{ needs.health-check.outputs.issues-detected }}",
+            "fix_applied": "${{ needs.auto-remediation.result == 'success' }}",
+            "infrastructure_state": "$(aws ec2 describe-instances --query 'Reservations[].Instances[].State.Name')"
+          }
+          EOF
+          
+          echo "📚 Datos de aprendizaje guardados para mejorar futuras predicciones"

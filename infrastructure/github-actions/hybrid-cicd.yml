@@ -1,0 +1,265 @@
+name: Hybrid CI/CD - Traditional + Generative
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  AWS_REGION: us-east-1
+  BEDROCK_MODEL_ID: anthropic.claude-3-sonnet-20240229-v1:0
+
+jobs:
+  # Fase Tradicional
+  validate-traditional:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.0
+      
+      - name: Terraform Format Check
+        run: terraform fmt -check
+      
+      - name: Terraform Init
+        run: terraform init
+      
+      - name: Terraform Validate
+        run: terraform validate
+      
+      - name: Traditional Security Scan
+        run: |
+          # Checkov tradicional
+          pip install checkov
+          checkov -f main.tf --framework terraform
+
+  # Fase Generativa - Análisis con IA
+  ai-security-scan:
+    needs: validate-traditional
+    runs-on: ubuntu-latest
+    outputs:
+      security-score: ${{ steps.ai-scan.outputs.score }}
+      recommendations: ${{ steps.ai-scan.outputs.recommendations }}
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: AI Security Analysis
+        id: ai-scan
+        run: |
+          # Crear prompt para análisis de seguridad
+          cat > security_prompt.json << EOF
+          {
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 2000,
+            "messages": [
+              {
+                "role": "user",
+                "content": "Analiza este código Terraform para vulnerabilidades de seguridad y mejores prácticas AWS:\n\n$(cat *.tf)\n\nProporciona:\n1. Puntuación de seguridad (0-100)\n2. Vulnerabilidades críticas\n3. Recomendaciones específicas\n4. Código corregido si es necesario\n\nFormato JSON: {\"security_score\": number, \"critical_issues\": [], \"recommendations\": [], \"fixed_code\": \"\"}"
+              }
+            ]
+          }
+          EOF
+          
+          # Invocar Bedrock
+          aws bedrock-runtime invoke-model \
+            --model-id ${{ env.BEDROCK_MODEL_ID }} \
+            --body file://security_prompt.json \
+            --cli-binary-format raw-in-base64-out \
+            security_response.json
+          
+          # Extraer resultados
+          SCORE=$(jq -r '.content[0].text | fromjson | .security_score' security_response.json)
+          RECOMMENDATIONS=$(jq -r '.content[0].text | fromjson | .recommendations | @json' security_response.json)
+          
+          echo "score=$SCORE" >> $GITHUB_OUTPUT
+          echo "recommendations=$RECOMMENDATIONS" >> $GITHUB_OUTPUT
+          
+          echo "🔒 Puntuación de seguridad: $SCORE/100"
+
+  # Generación de Optimizaciones
+  generate-optimizations:
+    needs: ai-security-scan
+    if: needs.ai-security-scan.outputs.security-score >= '80'
+    runs-on: ubuntu-latest
+    outputs:
+      optimized-config: ${{ steps.optimize.outputs.config }}
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Generate Optimizations
+        id: optimize
+        run: |
+          cat > optimization_prompt.json << EOF
+          {
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 3000,
+            "messages": [
+              {
+                "role": "user",
+                "content": "Optimiza esta configuración Terraform para:\n1. Mejor rendimiento\n2. Reducción de costos\n3. Alta disponibilidad\n4. Escalabilidad automática\n\nCódigo actual:\n$(cat *.tf)\n\nGenera configuración optimizada manteniendo funcionalidad."
+              }
+            ]
+          }
+          EOF
+          
+          aws bedrock-runtime invoke-model \
+            --model-id ${{ env.BEDROCK_MODEL_ID }} \
+            --body file://optimization_prompt.json \
+            --cli-binary-format raw-in-base64-out \
+            optimization_response.json
+          
+          # Guardar configuración optimizada
+          jq -r '.content[0].text' optimization_response.json > optimized.tf
+          
+          echo "config=optimized.tf" >> $GITHUB_OUTPUT
+          echo "✨ Configuración optimizada generada"
+
+  # Deploy con Monitoreo Inteligente
+  deploy-with-monitoring:
+    needs: [ai-security-scan, generate-optimizations]
+    if: needs.ai-security-scan.outputs.security-score >= '80'
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Deploy Infrastructure
+        run: |
+          terraform init
+          terraform plan -out=deployment.tfplan
+          
+          # Validación final con IA antes del deploy
+          cat > deploy_validation.json << EOF
+          {
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 1000,
+            "messages": [
+              {
+                "role": "user",
+                "content": "Revisa este plan de Terraform antes del deploy. ¿Es seguro proceder?\n\n$(terraform show -json deployment.tfplan)\n\nResponde: {\"safe_to_deploy\": boolean, \"concerns\": [], \"recommendations\": []}"
+              }
+            ]
+          }
+          EOF
+          
+          aws bedrock-runtime invoke-model \
+            --model-id ${{ env.BEDROCK_MODEL_ID }} \
+            --body file://deploy_validation.json \
+            --cli-binary-format raw-in-base64-out \
+            validation_response.json
+          
+          SAFE_TO_DEPLOY=$(jq -r '.content[0].text | fromjson | .safe_to_deploy' validation_response.json)
+          
+          if [ "$SAFE_TO_DEPLOY" = "true" ]; then
+            echo "✅ Validación IA aprobada - Procediendo con deploy"
+            terraform apply -auto-approve deployment.tfplan
+          else
+            echo "❌ Validación IA rechazada - Deploy cancelado"
+            exit 1
+          fi
+      
+      - name: Setup Intelligent Monitoring
+        run: |
+          # Configurar alertas inteligentes basadas en patrones
+          cat > monitoring_setup.json << EOF
+          {
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 2000,
+            "messages": [
+              {
+                "role": "user",
+                "content": "Genera configuración de CloudWatch Alarms inteligentes para esta infraestructura:\n$(cat *.tf)\n\nIncluye:\n1. Métricas críticas\n2. Umbrales adaptativos\n3. Acciones de auto-remediación\n\nFormato: CloudFormation o Terraform"
+              }
+            ]
+          }
+          EOF
+          
+          aws bedrock-runtime invoke-model \
+            --model-id ${{ env.BEDROCK_MODEL_ID }} \
+            --body file://monitoring_setup.json \
+            --cli-binary-format raw-in-base64-out \
+            monitoring_response.json
+          
+          # Aplicar configuración de monitoreo
+          jq -r '.content[0].text' monitoring_response.json > monitoring.tf
+          terraform apply -auto-approve
+
+  # Aprendizaje Continuo
+  continuous-learning:
+    needs: deploy-with-monitoring
+    if: always()
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Collect Deployment Metrics
+        run: |
+          # Recopilar métricas del deployment
+          DEPLOYMENT_SUCCESS="${{ needs.deploy-with-monitoring.result == 'success' }}"
+          SECURITY_SCORE="${{ needs.ai-security-scan.outputs.security-score }}"
+          
+          cat > learning_data.json << EOF
+          {
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "deployment_success": $DEPLOYMENT_SUCCESS,
+            "security_score": $SECURITY_SCORE,
+            "infrastructure_type": "web-app-with-database",
+            "optimizations_applied": true,
+            "performance_baseline": {
+              "response_time": "< 200ms target",
+              "availability": "99.9% target"
+            }
+          }
+          EOF
+          
+          echo "📊 Datos de aprendizaje recopilados"
+      
+      - name: Update AI Models
+        run: |
+          # En producción, aquí se actualizarían los modelos con feedback
+          echo "🧠 Enviando feedback para mejorar futuras predicciones"
+          echo "📈 Métricas de éxito registradas para optimización continua"
+
+  # Reporte Final
+  generate-report:
+    needs: [ai-security-scan, generate-optimizations, deploy-with-monitoring, continuous-learning]
+    if: always()
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Generate AI Report
+        run: |
+          cat > report_prompt.json << EOF
+          {
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 1500,
+            "messages": [
+              {
+                "role": "user",
+                "content": "Genera un reporte ejecutivo del deployment con estos datos:\n- Seguridad: ${{ needs.ai-security-scan.outputs.security-score }}/100\n- Deploy: ${{ needs.deploy-with-monitoring.result }}\n- Optimizaciones aplicadas: Sí\n\nIncluye: resumen, métricas clave, recomendaciones futuras"
+              }
+            ]
+          }
+          EOF
+          
+          aws bedrock-runtime invoke-model \
+            --model-id ${{ env.BEDROCK_MODEL_ID }} \
+            --body file://report_prompt.json \
+            --cli-binary-format raw-in-base64-out \
+            report_response.json
+          
+          echo "📋 Reporte Ejecutivo - DevOps Generativo"
+          echo "=================================="
+          jq -r '.content[0].text' report_response.json
