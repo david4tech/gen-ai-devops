@@ -40,7 +40,7 @@ with Diagram("GenAI DevOps - Arquitectura Detallada", show=False, filename="docs
         
         # AI Components
         bedrock = Bedrock("Amazon Bedrock\nClaude 3 Sonnet")
-        optimizer = Lambda("AI Optimizer Agent\n$45.67/día → $1,370/mes")
+        optimizer = Lambda("AI Optimizer Agent\n")
         
         # Monitoring
         cloudwatch = Cloudwatch("CloudWatch\nMetrics & Alertas")
